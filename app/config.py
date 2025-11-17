@@ -1,0 +1,46 @@
+from pydantic_settings import BaseSettings
+from typing import List
+
+class Settings(BaseSettings):
+    # Database
+    DATABASE_URL: str
+    
+    # Security
+    SECRET_KEY: str
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    
+    # Google OAuth
+    GOOGLE_CLIENT_ID: str
+    GOOGLE_CLIENT_SECRET: str
+    
+    # Gemini API
+    GEMINI_API_KEY: str
+    
+    # File Storage
+    TEMPLATE_PREVIEW_DIR: str = "template_previews" 
+    UPLOAD_DIR: str = "./uploads"
+    GENERATED_DIR: str = "./generated"
+    MAX_FILE_SIZE: int = 10485760  # 10MB
+    
+    # App Config
+    FRONTEND_URL: str
+    BACKEND_URL: str
+    
+    # Free Tier
+    FREE_GENERATION_LIMIT: int = 2
+    FREE_TEMPLATE_IDS: str = "1,2"
+    
+    # Subscription
+    BASIC_PLAN_PRICE: int = 20000
+    BASIC_PLAN_CREDITS: int = 20
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
+    
+    @property
+    def free_template_ids_list(self) -> List[int]:
+        return [int(id.strip()) for id in self.FREE_TEMPLATE_IDS.split(",")]
+
+settings = Settings()
