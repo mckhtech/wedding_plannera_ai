@@ -11,8 +11,12 @@ from app.utils.dependencies import get_current_user, check_user_credits
 from app.services.storage_service import StorageService
 from app.services.image_generation_service import ImageGenerationService
 from pathlib import Path
+import logging
+from datetime import datetime
+
 
 router = APIRouter(prefix="/api/generate", tags=["Image Generation"])
+logger = logging.getLogger(__name__)
 
 async def process_generation(
     generation_id: int,
@@ -23,13 +27,37 @@ async def process_generation(
     db_session
 ):
     """Background task to process image generation"""
+    generation = None
     try:
+        logger.info(f"🔄 Processing generation {generation_id}")
+        logger.info(f"   User image path: {user_image_path}")
+        logger.info(f"   Partner image path: {partner_image_path}")
+        
         # Update status to processing
         generation = db_session.query(Generation).filter(Generation.id == generation_id).first()
+        if not generation:
+            logger.error(f"❌ Generation {generation_id} not found in database")
+            return
+            
         generation.status = GenerationStatus.PROCESSING
         db_session.commit()
+        logger.info(f"   Status updated to PROCESSING")
+        
+        # Verify files exist before processing
+        from pathlib import Path
+        user_path = Path(user_image_path)
+        if not user_path.exists():
+            raise FileNotFoundError(f"User image not found: {user_image_path}")
+        logger.info(f"   ✓ User image exists: {user_path.stat().st_size} bytes")
+        
+        if partner_image_path:
+            partner_path = Path(partner_image_path)
+            if not partner_path.exists():
+                raise FileNotFoundError(f"Partner image not found: {partner_image_path}")
+            logger.info(f"   ✓ Partner image exists: {partner_path.stat().st_size} bytes")
         
         # Generate image
+        logger.info(f"   Starting image generation with Gemini...")
         image_service = ImageGenerationService()
         generated_path, watermarked_path = await image_service.generate_image(
             user_image_path,
@@ -37,6 +65,10 @@ async def process_generation(
             prompt,
             add_watermark
         )
+        
+        logger.info(f"   ✅ Generation complete!")
+        logger.info(f"   Generated path: {generated_path}")
+        logger.info(f"   Watermarked path: {watermarked_path}")
         
         # Update generation record
         generation.generated_image_path = generated_path
@@ -46,14 +78,18 @@ async def process_generation(
         generation.has_watermark = add_watermark
         
         db_session.commit()
+        logger.info(f"✅ Generation {generation_id} completed successfully and saved to database")
         
     except Exception as e:
+        logger.error(f"❌ Generation {generation_id} failed: {str(e)}")
+        logger.exception("Full traceback:")
+        
         # Update with error
-        generation = db_session.query(Generation).filter(Generation.id == generation_id).first()
-        generation.status = GenerationStatus.FAILED
-        generation.error_message = str(e)
-        db_session.commit()
-
+        if generation:
+            generation.status = GenerationStatus.FAILED
+            generation.error_message = str(e)
+            db_session.commit()
+            logger.info(f"   Error status saved to database")
 @router.post("/", response_model=GenerationResponse, status_code=status.HTTP_201_CREATED)
 async def create_generation(
     template_id: int,

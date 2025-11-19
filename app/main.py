@@ -9,7 +9,9 @@ from app.config import settings
 from app.database import engine, Base
 from app.api import auth, templates, generation, admin
 import app.models  # 👈 ensures all models are loaded
+import logging
 
+logger = logging.getLogger(__name__)
 # Create database tables
 Base.metadata.create_all(bind=engine)
 
@@ -74,6 +76,24 @@ async def health_check():
         "status": "healthy",
         "database": "connected"
     }
+    
+@app.on_event("startup")
+async def startup_event():
+    """Initialize application on startup"""
+    # Create required directories
+    directories = [
+        settings.UPLOAD_DIR,
+        settings.GENERATED_DIR,
+        settings.TEMPLATE_PREVIEW_DIR
+    ]
+    
+    for directory in directories:
+        Path(directory).mkdir(parents=True, exist_ok=True)
+        logger.info(f"✅ Directory ready: {directory}")
+    
+    logger.info("🚀 Application started successfully")
+
+
 
 if __name__ == "__main__":
     import uvicorn
