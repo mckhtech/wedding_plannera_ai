@@ -6,6 +6,7 @@ from app.schemas.user import UserCreate, UserResponse
 from app.services.auth_service import AuthService
 from app.utils.dependencies import get_current_user
 from app.models.user import User
+from app.models.payment_token import PaymentToken, TokenStatus, PaymentStatus
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
@@ -46,3 +47,45 @@ async def get_current_user_info(current_user: User = Depends(get_current_user)):
 async def verify_token(current_user: User = Depends(get_current_user)):
     """Verify if token is valid"""
     return {"valid": True, "user_id": current_user.id}
+
+# ============================================
+# NEW: USER CREDIT & TOKEN INFO
+# ============================================
+
+@router.get("/me/credits")
+async def get_user_credits(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Get detailed credit and token information for current user
+    """
+    
+    # Count unused paid tokens
+    unused_tokens = db.query(PaymentToken).filter(
+        PaymentToken.user_id == current_user.id,
+        PaymentToken.status == TokenStatus.UNUSED,
+        PaymentToken.payment_status == PaymentStatus.COMPLETED
+    ).all()
+    
+    # Group by template
+    tokens_by_template = {}
+    for token in unused_tokens:
+        if token.template_id not in tokens_by_template:
+            tokens_by_template[token.template_id] = []
+        tokens_by_template[token.template_id].append({
+            "token_id": token.id,
+            "amount_paid": float(token.amount_paid),
+            "created_at": token.created_at.isoformat()
+        })
+    
+    return {
+        "user_id": current_user.id,
+        "email": current_user.email,
+        "free_credits_remaining": current_user.free_credits_remaining,
+        "is_subscribed": current_user.is_subscribed,
+        "can_generate_free": current_user.free_credits_remaining > 0,
+        "unused_paid_tokens": len(unused_tokens),
+        "tokens_by_template": tokens_by_template,
+        "message": f"You have {current_user.free_credits_remaining} free generations remaining"
+    }

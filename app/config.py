@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     # Gemini API
     GEMINI_API_KEY: str
     
+    #razor pay
+    RAZORPAY_KEY_ID: str
+    RAZORPAY_KEY_SECRET : str
+    
     # File Storage
     TEMPLATE_PREVIEW_DIR: str = "template_previews" 
     UPLOAD_DIR: str = "./uploads"

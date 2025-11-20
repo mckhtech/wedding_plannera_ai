@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, Text, DateTime
+from sqlalchemy import Column, Integer, String, Boolean, Text, DateTime, Numeric
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from app.database import Base
@@ -12,10 +12,15 @@ class Template(Base):
     prompt = Column(Text, nullable=False)
     preview_image = Column(String, nullable=True)
     
-    is_free = Column(Boolean, default=False)
+    # Template type - UPDATED
+    is_free = Column(Boolean, default=False)  # TRUE = free template, FALSE = paid
     is_active = Column(Boolean, default=True)
     
-    # Archive fields - NEW
+    # Pricing for paid templates - NEW
+    price = Column(Numeric(10, 2), default=0.00)  # Price per generation
+    currency = Column(String, default="INR")
+    
+    # Archive fields
     is_archived = Column(Boolean, default=False)
     archived_at = Column(DateTime, nullable=True)
     
@@ -30,3 +35,4 @@ class Template(Base):
     
     # Relationships
     generations = relationship("Generation", back_populates="template")
+    payment_tokens = relationship("PaymentToken", back_populates="template")

@@ -24,3 +24,5 @@ alembic
 google-genai 
 Pillow 
 python-dotenv
+razorpay
+requests

@@ -9,5 +9,5 @@ venv/
 alembic.ini
 uploads/
 template_previews/
-generated_images/
+generated/
 instance/

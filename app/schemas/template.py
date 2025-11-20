@@ -1,5 +1,6 @@
-from pydantic import BaseModel, Field
-from typing import Optional,List
+# schemas/template.py
+from pydantic import BaseModel, Field, computed_field
+from typing import Optional, List
 from datetime import datetime
 
 class TemplateBase(BaseModel):
@@ -8,6 +9,8 @@ class TemplateBase(BaseModel):
     prompt: str = Field(..., min_length=10)
     is_free: bool = False
     display_order: int = 0
+    price: float = 0.0           # or Decimal if you prefer
+    currency: str = "INR"
 
 class TemplateCreate(TemplateBase):
     """Schema for creating a new template"""
@@ -21,7 +24,8 @@ class TemplateUpdate(BaseModel):
     is_free: Optional[bool] = None
     is_active: Optional[bool] = None
     display_order: Optional[int] = None
-
+    price: Optional[float] = None
+    currency: Optional[str] = None
 class TemplateResponse(TemplateBase):
     """Schema for template responses"""
     id: int
@@ -31,16 +35,30 @@ class TemplateResponse(TemplateBase):
     created_at: datetime
     updated_at: datetime
     
-    class Config:
-        from_attributes = True  # Updated from orm_mode for Pydantic v2
-
-
-class TemplateListItem(TemplateResponse):
-    preview_url: Optional[str] = None  # If you want URL in list
-
+    # Store request for URL generation
+    _request: Optional[object] = None
+    
+    # Computed field for preview URL
+    @computed_field
+    @property
+    def preview_url(self) -> Optional[str]:
+        """Convert preview image path to full URL"""
+        if self.preview_image:
+            from app.services.storage_service import StorageService
+            return StorageService.get_file_url(self.preview_image, self._request)
+        return None
+    
     class Config:
         from_attributes = True
+        arbitrary_types_allowed = True
 
+class TemplateListItem(TemplateResponse):
+    """Template item for list view - inherits preview_url from TemplateResponse"""
+    is_paid: Optional[bool] = False  # ← Changed to is_paid
+    
+    class Config:
+        from_attributes = True
+        arbitrary_types_allowed = True
 
 class TemplateListResponse(BaseModel):
     templates: List[TemplateListItem]

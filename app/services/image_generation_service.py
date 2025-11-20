@@ -141,43 +141,69 @@ class ImageGenerationService:
             raise Exception(f"Image generation failed: {str(e)}")
     
     def _create_generation_prompt(self, template_prompt: str, has_partner: bool = False) -> str:
-        """Create a comprehensive prompt for image generation"""
+        """Enhanced version with better accuracy"""
         
-        base_prompt = """You are a professional wedding photographer and AI image generator.
-Your task is to create a stunning, high-quality pre-wedding photoshoot image."""
+        base_prompt = """You are an expert AI image generator specializing in photorealistic portraits.
+    Your PRIMARY OBJECTIVE is to maintain EXACT facial accuracy from the reference images provided.
+    This is a professional pre-wedding photoshoot that must preserve the individuals' unique features."""
         
         if has_partner:
             people_description = """
-I am providing you with two images - one of a person and one of their partner.
-Please use both people in the generated image, maintaining their facial features, skin tones, and unique characteristics accurately."""
+    CRITICAL INSTRUCTIONS FOR FACIAL ACCURACY:
+    - Person 1 and Person 2 are provided in separate images
+    - You MUST maintain their EXACT facial features, including:
+    * Face shape and bone structure
+    * Eye shape, color, and spacing
+    * Nose shape and size
+    * Lip shape and fullness
+    * Skin tone and texture
+    * Hair color, style, and texture
+    * Unique identifying features (moles, freckles, etc.)
+    - Do NOT idealize or alter their appearances
+    - Keep their natural proportions and characteristics
+    """
         else:
             people_description = """
-I am providing you with an image of a person.
-Please use this person in the generated image, maintaining their facial features, skin tone, and unique characteristics accurately."""
+    CRITICAL INSTRUCTIONS FOR FACIAL ACCURACY:
+    - One person's image is provided as reference
+    - You MUST maintain their EXACT facial features, including:
+    * Face shape and bone structure
+    * Eye shape, color, and spacing
+    * Nose shape and size
+    * Lip shape and fullness
+    * Skin tone and texture
+    * Hair color, style, and texture
+    * Unique identifying features (moles, freckles, etc.)
+    - Do NOT idealize or alter their appearance
+    - Keep their natural proportions and characteristics
+    """
         
         requirements = f"""
 
-Scene Requirements:
-{template_prompt}
+    SCENE DESCRIPTION:
+    {template_prompt}
 
-Quality Standards:
-- Create a photorealistic, high-resolution image (at least 1024x1024 pixels)
-- Ensure natural lighting that flatters the subject(s)
-- Maintain accurate facial features and skin tones from the provided images
-- Create professional composition with proper depth of field
-- Ensure the scene matches the template description perfectly
-- Add appropriate props, background elements, and atmospheric effects
-- Make the image look like it was taken by a professional photographer
+    TECHNICAL REQUIREMENTS:
+    - Resolution: Minimum 1024x1024 pixels, prefer 4K quality
+    - Lighting: Professional photography lighting appropriate for the scene
+    - Composition: Follow rule of thirds, professional framing
+    - Depth of Field: Appropriate for the scene with subject focus
+    - Color Grading: Professional wedding photography style
+    - Background: Detailed and realistic matching the scene description
 
-Style Guidelines:
-- The image should look natural and authentic, not overly edited
-- Colors should be vibrant but realistic
-- The mood should be romantic and joyful
-- Ensure the subjects look comfortable and naturally posed
-"""
+    QUALITY CHECKLIST:
+    ✓ Facial features match reference images EXACTLY
+    ✓ Natural skin tones preserved
+    ✓ Professional photography quality
+    ✓ Appropriate for wedding/romantic context
+    ✓ Photorealistic, not artistic or stylized
+    ✓ Proper lighting and exposure
+    ✓ Sharp focus on subjects' faces
+    """
         
         return base_prompt + people_description + requirements
-    
+
+
     async def test_generation(self) -> dict:
         """
         Test the image generation service with Gemini API
