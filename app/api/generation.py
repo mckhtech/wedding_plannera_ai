@@ -78,7 +78,7 @@ async def process_generation(
                 PaymentToken.id == generation.payment_token_id
             ).first()
             if token:
-                token.mark_as_used(generation.id)
+                token.mark_as_used()
         
         db_session.commit()
         logger.info(f"✅ Generation {generation_id} completed successfully")
