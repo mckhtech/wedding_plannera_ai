@@ -19,7 +19,7 @@ from typing import Dict, Any
 BASE_URL = "http://127.0.0.1:8000"  # Change if your backend runs on different port
 TEST_USER_EMAIL = "usernew@example.com"  # Change to your test user
 TEST_USER_PASSWORD = "password@123"  # Change to your test user password
-PAID_TEMPLATE_ID = 31  # Your paid template ID
+PAID_TEMPLATE_ID = 3  # Your paid template ID
 
 
 class RazorpayTester:

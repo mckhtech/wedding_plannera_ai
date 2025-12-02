@@ -6,7 +6,8 @@ import uuid
 from app.config import settings
 from app.services.watermark_service import WatermarkService
 from PIL import Image
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
+from app.models.generation import GenerationMode
 
 logger = logging.getLogger(__name__)
 
@@ -23,17 +24,25 @@ class ImageGenerationService:
     
     async def generate_image(
         self, 
-        user_image_path: str,
+        generation_mode: GenerationMode,
+        user_image_path: Optional[str] = None,
         partner_image_path: Optional[str] = None,
+        couple_image_path: Optional[str] = None,
+        user_images: Optional[Dict[str, str]] = None,
+        partner_images: Optional[Dict[str, str]] = None,
         prompt: str = "",
         add_watermark: bool = False
     ) -> Tuple[str, Optional[str]]:
         """
-        Generate image using Gemini API
+        Generate image using Gemini API with support for multiple modes
         
         Args:
-            user_image_path: Path to user's image
-            partner_image_path: Path to partner's image (optional)
+            generation_mode: Mode of generation (SINGLE, COUPLE, MULTI_ANGLE)
+            user_image_path: Path to user's image (Mode 1)
+            partner_image_path: Path to partner's image (Mode 1)
+            couple_image_path: Path to couple image (Mode 2)
+            user_images: Dict of user images {angle: path} (Mode 3)
+            partner_images: Dict of partner images {angle: path} (Mode 3)
             prompt: Template prompt for image generation
             add_watermark: Whether to add watermark to generated image
             
@@ -44,34 +53,26 @@ class ImageGenerationService:
             Exception: If image generation fails
         """
         try:
-            logger.info("Starting image generation")
-            logger.debug(f"User image: {user_image_path}")
-            logger.debug(f"Partner image: {partner_image_path}")
-            logger.debug(f"Add watermark: {add_watermark}")
+            logger.info(f"Starting image generation - Mode: {generation_mode}")
             
-            # Validate and load images
-            user_path = self._validate_and_get_path(user_image_path, "User")
-            partner_path = None
-            if partner_image_path:
-                partner_path = self._validate_and_get_path(partner_image_path, "Partner")
-            
-            # Create generation prompt
-            full_prompt = self._create_generation_prompt(prompt, has_partner=partner_path is not None)
-            logger.debug(f"Prompt created (length: {len(full_prompt)} chars)")
+            # Load images based on mode
+            if generation_mode == GenerationMode.SINGLE:
+                contents, full_prompt = self._prepare_single_mode(
+                    user_image_path, partner_image_path, prompt
+                )
+            elif generation_mode == GenerationMode.COUPLE:
+                contents, full_prompt = self._prepare_couple_mode(
+                    couple_image_path, prompt
+                )
+            elif generation_mode == GenerationMode.MULTI_ANGLE:
+                contents, full_prompt = self._prepare_multi_angle_mode(
+                    user_images, partner_images, prompt
+                )
+            else:
+                raise ValueError(f"Invalid generation mode: {generation_mode}")
             
             # Initialize Gemini client
             client = genai.Client(api_key=self.api_key)
-            
-            # Load images
-            user_image = Image.open(user_path)
-            logger.debug(f"User image loaded: {user_image.size}")
-            
-            contents = [full_prompt, user_image]
-            
-            if partner_path:
-                partner_image = Image.open(partner_path)
-                logger.debug(f"Partner image loaded: {partner_image.size}")
-                contents.append(partner_image)
             
             # Configure generation
             config = types.GenerateContentConfig(
@@ -107,6 +108,78 @@ class ImageGenerationService:
         except Exception as e:
             logger.error(f"Image generation failed: {str(e)}", exc_info=True)
             raise Exception(f"Image generation failed: {str(e)}")
+    
+    def _prepare_single_mode(
+        self, 
+        user_image_path: str, 
+        partner_image_path: Optional[str],
+        prompt: str
+    ) -> Tuple[list, str]:
+        """Prepare content for SINGLE mode (1 user + optional partner)"""
+        logger.info("Preparing SINGLE mode generation")
+        
+        user_path = self._validate_and_get_path(user_image_path, "User")
+        user_image = Image.open(user_path)
+        logger.debug(f"User image loaded: {user_image.size}")
+        
+        has_partner = partner_image_path is not None
+        contents = [self._create_generation_prompt(prompt, GenerationMode.SINGLE, has_partner), user_image]
+        
+        if partner_image_path:
+            partner_path = self._validate_and_get_path(partner_image_path, "Partner")
+            partner_image = Image.open(partner_path)
+            logger.debug(f"Partner image loaded: {partner_image.size}")
+            contents.append(partner_image)
+        
+        return contents, prompt
+    
+    def _prepare_couple_mode(
+        self,
+        couple_image_path: str,
+        prompt: str
+    ) -> Tuple[list, str]:
+        """Prepare content for COUPLE mode (1 image with both people)"""
+        logger.info("Preparing COUPLE mode generation")
+        
+        couple_path = self._validate_and_get_path(couple_image_path, "Couple")
+        couple_image = Image.open(couple_path)
+        logger.debug(f"Couple image loaded: {couple_image.size}")
+        
+        full_prompt = self._create_generation_prompt(prompt, GenerationMode.COUPLE, True)
+        contents = [full_prompt, couple_image]
+        
+        return contents, prompt
+    
+    def _prepare_multi_angle_mode(
+        self,
+        user_images: Dict[str, str],
+        partner_images: Dict[str, str],
+        prompt: str
+    ) -> Tuple[list, str]:
+        """Prepare content for MULTI_ANGLE mode (multiple user + partner images)"""
+        logger.info("Preparing MULTI_ANGLE mode generation")
+        
+        # Load all user images
+        full_prompt = self._create_generation_prompt(prompt, GenerationMode.MULTI_ANGLE, True)
+        contents = [full_prompt]
+        
+        # Add all user images
+        logger.info(f"Loading {len(user_images)} user images")
+        for angle, path in user_images.items():
+            user_path = self._validate_and_get_path(path, f"User {angle}")
+            user_img = Image.open(user_path)
+            logger.debug(f"User {angle} image loaded: {user_img.size}")
+            contents.append(user_img)
+        
+        # Add all partner images
+        logger.info(f"Loading {len(partner_images)} partner images")
+        for angle, path in partner_images.items():
+            partner_path = self._validate_and_get_path(path, f"Partner {angle}")
+            partner_img = Image.open(partner_path)
+            logger.debug(f"Partner {angle} image loaded: {partner_img.size}")
+            contents.append(partner_img)
+        
+        return contents, prompt
     
     def _validate_and_get_path(self, file_path: str, label: str) -> Path:
         """Validate file exists and return Path object"""
@@ -158,91 +231,127 @@ class ImageGenerationService:
             
         except Exception as e:
             logger.error(f"Watermark addition failed: {str(e)}")
-            # Return original path if watermarking fails
             return str(image_path)
     
-    def _create_generation_prompt(self, template_prompt: str, has_partner: bool = False) -> str:
-        """Create comprehensive prompt for image generation"""
-        
-        base_prompt = """You are an expert AI image generator specializing in photorealistic portraits.
-Your PRIMARY OBJECTIVE is to maintain EXACT facial accuracy from the reference images provided.
-This is a professional pre-wedding photoshoot that must preserve the individuals' unique features."""
-        
-        if has_partner:
-            people_description = """
-CRITICAL INSTRUCTIONS FOR FACIAL ACCURACY:
-- Person 1 and Person 2 are provided in separate images
-- You MUST maintain their EXACT facial features, including:
-  * Face shape and bone structure
-  * Eye shape, color, and spacing
-  * Nose shape and size
-  * Lip shape and fullness
-  * Skin tone and texture
-  * Hair color, style, and texture
-  * Unique identifying features (moles, freckles, etc.)
-- Do NOT idealize or alter their appearances
-- Keep their natural proportions and characteristics
-"""
-        else:
-            people_description = """
-CRITICAL INSTRUCTIONS FOR FACIAL ACCURACY:
-- One person's image is provided as reference
-- You MUST maintain their EXACT facial features, including:
-  * Face shape and bone structure
-  * Eye shape, color, and spacing
-  * Nose shape and size
-  * Lip shape and fullness
-  * Skin tone and texture
-  * Hair color, style, and texture
-  * Unique identifying features (moles, freckles, etc.)
-- Do NOT idealize or alter their appearance
-- Keep their natural proportions and characteristics
-"""
-        
-        requirements = f"""
+    def _create_generation_prompt(
+        self, 
+        template_prompt: str, 
+        mode: GenerationMode,
+        has_partner: bool = False
+    ) -> str:
+        """Optimized prompt for Gemini image generation with strict identity preservation"""
 
-SCENE DESCRIPTION:
-{template_prompt}
+        base_prompt = """You are an expert AI photographer creating photorealistic pre-wedding portraits.
 
-TECHNICAL REQUIREMENTS:
-- Resolution: Minimum 1024x1024 pixels, prefer 4K quality
-- Lighting: Professional photography lighting appropriate for the scene
-- Composition: Follow rule of thirds, professional framing
-- Depth of Field: Appropriate for the scene with subject focus
-- Color Grading: Professional wedding photography style
-- Background: Detailed and realistic matching the scene description
+    CRITICAL REQUIREMENT - IDENTITY PRESERVATION:
+    The generated image MUST contain the exact same people from the reference photos with zero identity modification.
+    This is photographic reproduction of real individuals, not character creation or beautification.
 
-QUALITY CHECKLIST:
-✓ Facial features match reference images EXACTLY
-✓ Natural skin tones preserved
-✓ Professional photography quality
-✓ Appropriate for wedding/romantic context
-✓ Photorealistic, not artistic or stylized
-✓ Proper lighting and exposure
-✓ Sharp focus on subjects' faces
-"""
-        
-        return base_prompt + people_description + requirements
+    MANDATORY PRESERVATION:
+    - Exact face structure and proportions
+    - Natural facial asymmetry
+    - Authentic skin texture and tone
+    - Real eyebrow shape and hairline
+    - Distinctive marks (freckles, moles, scars, beard patterns)
+    - Eye shape, spacing, and color
+    - Nose structure and dimensions
+    - Lip shape and fullness
+    - Jawline and chin contour
+    - Body build and proportions
+    """
 
-    async def test_generation(self) -> dict:
-        """
-        Test the image generation service
-        
-        Returns:
-            dict: Status and model information
-        """
-        try:
-            client = genai.Client(api_key=self.api_key)
-            logger.info(f"Gemini client initialized with model: {self.model_name}")
-            
-            return {
-                "status": "success",
-                "model": self.model_name,
-                "message": "Image generation service is ready"
-            }
-        except Exception as e:
-            logger.error(f"Service test failed: {str(e)}", exc_info=True)
-            return {
-                "status": "error",
-                "message": str(e)
-            }
+        # MODE-SPECIFIC INSTRUCTIONS
+        if mode == GenerationMode.SINGLE:
+            if has_partner:
+                mode_instructions = """
+    INPUT MODE: Two separate individual images (Person 1 and Person 2)
+
+    IDENTITY LOCK REQUIREMENTS:
+    - Person 1 facial features must match Person 1 reference exactly
+    - Person 2 facial features must match Person 2 reference exactly
+    - Preserve natural height difference between subjects
+    - Maintain authentic body proportions for both individuals
+    - Keep distinct facial characteristics separate (do not blend or average)
+    """
+            else:
+                mode_instructions = """
+    INPUT MODE: Single subject image
+
+    IDENTITY LOCK REQUIREMENTS:
+    - Output must contain the exact person from reference
+    - All facial features must remain geometrically identical
+    - Preserve unique facial characteristics and asymmetries
+    - Maintain authentic proportions and contours
+    """
+
+        elif mode == GenerationMode.COUPLE:
+            mode_instructions = """
+    INPUT MODE: One image containing both people together
+
+    IDENTITY LOCK REQUIREMENTS:
+    - Preserve both individuals' unique facial identities
+    - Maintain natural height and body proportion differences
+    - Keep authentic spatial relationship and chemistry
+    - Do not average or blend facial features between subjects
+    - Preserve each person's distinct characteristics independently
+    """
+
+        elif mode == GenerationMode.MULTI_ANGLE:
+            mode_instructions = """
+    INPUT MODE: Multiple reference images showing each person from different angles
+
+    IDENTITY LOCK REQUIREMENTS:
+    - Construct accurate 3D facial geometry from all provided angles
+    - Front view: locks inner facial feature geometry (eye spacing, nose shape, lip contour)
+    - Side/profile view: locks nose bridge, forehead slope, jaw angle, chin projection
+    - Three-quarter view: locks facial depth, cheekbone position, head proportion
+    - Synthesize consistent identity across all angles without drift or variation
+    - Preserve micro-details visible in any reference angle (beard texture, facial asymmetry)
+    """
+
+        scene_requirements = f"""
+    SCENE INSTRUCTIONS:
+    {template_prompt}
+
+    ALLOWED MODIFICATIONS:
+    - Clothing and outfit styling (must suit the scene)
+    - Background environment and setting
+    - Lighting setup and quality
+    - Pose and body positioning
+    - Camera angle and framing
+    - Color grading and cinematic tone
+
+    STRICTLY PROHIBITED:
+    - Any alteration to facial geometry or proportions
+    - Facial symmetry enhancement or smoothing
+    - Eye, lip, or nose size modifications
+    - Face or body slimming/reshaping
+    - Age, ethnicity, or skin tone changes
+    - Beauty filters or AI enhancement
+    - Generic or idealized facial features
+    - Identity drift or feature averaging
+    - Creating new faces or replacing subjects
+
+    TECHNICAL SPECIFICATIONS:
+    - Output resolution: 4K minimum
+    - Depth of field: shallow (sharp subject, soft background)
+    - Lighting style: soft cinematic wedding photography
+    - Image type: photorealistic, real camera simulation
+    - Composition: professional portrait framing standards
+
+    QUALITY VERIFICATION CHECKLIST:
+    - Subject appears identical to reference images
+    - All facial features geometrically unchanged
+    - Face proportions accurately maintained
+    - Natural asymmetries preserved
+    - Distinctive marks present (freckles, scars, etc.)
+    - Skin tone matches reference
+    - Height differences maintained (if couple)
+    - Body types consistent with reference
+    - Scene matches template requirements
+
+    FINAL CONSTRAINT:
+    If forced to choose between scene aesthetic quality and identity accuracy, always prioritize identity accuracy.
+    Generate the exact people from the references, not idealized versions."""
+
+        return base_prompt + mode_instructions + scene_requirements

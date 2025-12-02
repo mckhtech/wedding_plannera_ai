@@ -57,6 +57,8 @@ async def create_template(
     prompt: str = Form(...),
     is_free: bool = Form(False),
     display_order: int = Form(0),
+    price: Optional[float] = Form(0.0),           # ← ADD THIS
+    currency: Optional[str] = Form("INR"),
     preview_image: Optional[UploadFile] = File(None),
     current_admin: User = Depends(get_current_admin),
     db: Session = Depends(get_db)
@@ -98,7 +100,9 @@ async def create_template(
             prompt=prompt,
             preview_image=preview_image_path,
             is_free=is_free,
-            display_order=display_order
+            display_order=display_order,
+            price=price,                 # ← ADD THIS
+            currency=currency
         )
         
         db.add(template)
@@ -122,6 +126,8 @@ async def update_template(
     description: Optional[str] = Form(None),
     prompt: Optional[str] = Form(None),
     is_free: Optional[bool] = Form(None),
+    price: Optional[float] = Form(None),         # ← ADD THIS
+    currency: Optional[str] = Form(None),        # ← ADD THIS
     display_order: Optional[int] = Form(None),
     is_active: Optional[bool] = Form(None),
     preview_image: Optional[UploadFile] = File(None),
@@ -150,6 +156,11 @@ async def update_template(
         template.display_order = display_order
     if is_active is not None:
         template.is_active = is_active
+        
+    if price is not None:         # ← ADD THIS
+        template.price = price
+    if currency is not None:      # ← ADD THIS
+        template.currency = currency
     
     # Handle preview image update
     if preview_image and preview_image.filename:
@@ -343,6 +354,8 @@ async def get_all_templates_admin(
             "preview_url": StorageService.get_file_url(template.preview_image) if template.preview_image else None,
             "is_free": template.is_free,
             "is_active": template.is_active,
+            "price":template.price,
+            "currency":template.currency,
             "is_archived": template.is_archived,
             "archived_at": template.archived_at,
             "display_order": template.display_order,
@@ -380,6 +393,8 @@ async def get_archived_templates(
             "preview_url": StorageService.get_file_url(template.preview_image) if template.preview_image else None,
             "is_free": template.is_free,
             "is_active": template.is_active,
+            "price":template.price,
+            "currency":template.currency,
             "is_archived": template.is_archived,
             "archived_at": template.archived_at,
             "display_order": template.display_order,

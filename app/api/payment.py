@@ -30,6 +30,7 @@ class PaymentOrderResponse(BaseModel):
 
 class PaymentVerifyRequest(BaseModel):
     payment_id: str
+    order_id: str  # Added order_id
     token_id: int
     razorpay_signature: Optional[str] = None
 
@@ -110,6 +111,12 @@ async def verify_payment(
     Verify payment completion
     
     Called by frontend after payment gateway confirms payment
+    
+    Request body should contain:
+    - payment_id: Razorpay payment ID (e.g., pay_xxxxx)
+    - order_id: Razorpay order ID (e.g., order_xxxxx) 
+    - token_id: Your internal token ID
+    - razorpay_signature: Signature for verification (production only)
     """
     
     # Get token
@@ -124,13 +131,24 @@ async def verify_payment(
             detail="Payment token not found"
         )
     
+    # Check if already completed
+    if token.payment_status == PaymentStatus.COMPLETED:
+        logger.info(f"Payment already verified for token {token.id}")
+        return {
+            "success": True,
+            "message": "Payment already verified",
+            "token_id": token.id,
+            "can_generate": True
+        }
+    
     # Verify payment
     try:
         success = PaymentService.verify_payment(
-            request.payment_id,
-            request.token_id,
-            db,
-            request.razorpay_signature
+            payment_id=request.payment_id,
+            order_id=request.order_id,
+            token_id=request.token_id,
+            db=db,
+            razorpay_signature=request.razorpay_signature
         )
         
         if success:

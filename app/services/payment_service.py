@@ -14,6 +14,8 @@ from app.models.payment_token import PaymentToken, PaymentStatus, TokenStatus
 from app.models.user import User
 from app.models.template import Template
 import secrets
+import hmac
+import hashlib
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -70,20 +72,23 @@ class PaymentService:
             
             # TEST MODE
             if PaymentService._is_test_mode():
-                logger.info(f"TEST MODE: Auto-completing payment for token {token.id}")
+                logger.info(f"TEST MODE: Creating test order for token {token.id}")
                 
-                token.payment_id = f"TEST_PAY_{secrets.token_hex(8)}"
-                token.payment_status = PaymentStatus.COMPLETED
+                # Generate test order ID (not payment ID yet)
+                test_order_id = f"order_TEST_{secrets.token_hex(8)}"
+                token.payment_id = test_order_id  # Store order ID temporarily
                 db.commit()
                 
                 return {
                     "token_id": token.id,
-                    "payment_id": token.payment_id,
+                    "payment_id": None,
+                    "order_id": test_order_id,
                     "amount": float(token.amount_paid),
                     "currency": token.currency,
-                    "status": "completed",
+                    "status": "pending",
                     "test_mode": True,
-                    "message": "Test payment auto-completed"
+                    "message": "Test mode: Use any payment_id to verify",
+                    "razorpay_key": "rzp_test_TESTMODE"
                 }
             
             # PRODUCTION MODE
@@ -113,12 +118,13 @@ class PaymentService:
             order = client.order.create(data=order_data)
             logger.info(f"Razorpay order created: {order['id']}")
             
-            # Save order ID
+            # Save order ID (not payment ID yet)
             token.payment_id = order['id']
             db.commit()
             
             return {
                 "token_id": token.id,
+                "payment_id": None,
                 "order_id": order['id'],
                 "amount": float(template.price),
                 "currency": template.currency,
@@ -138,88 +144,84 @@ class PaymentService:
             
             raise Exception(f"Failed to create payment order: {str(e)}")
     
+
     @staticmethod
     def verify_payment(
         payment_id: str,
+        order_id: str,
         token_id: int,
         db: Session,
-        razorpay_signature: Optional[str] = None,
-        order_id: Optional[str] = None
+        razorpay_signature: Optional[str] = None
     ) -> bool:
         """
         Verify payment completion
         
         Args:
-            payment_id: Payment ID from gateway
+            payment_id: Razorpay payment ID (e.g., pay_xxxxx)
+            order_id: Razorpay order ID (e.g., order_xxxxx)
             token_id: Payment token ID
             db: Database session
-            razorpay_signature: Signature for verification (production only)
-            order_id: Order ID (production only)
+            razorpay_signature: Razorpay signature for verification
             
         Returns:
-            bool: True if payment verified successfully
-            
-        Raises:
-            ValueError: If token not found
+            bool: True if verification successful
         """
         
+        # Get token
         token = db.query(PaymentToken).filter(PaymentToken.id == token_id).first()
         if not token:
             logger.error(f"Payment token not found: {token_id}")
-            raise ValueError("Payment token not found")
+            return False
         
         try:
-            # TEST MODE
+            # TEST MODE - Skip signature verification
             if PaymentService._is_test_mode():
-                logger.info(f"TEST MODE: Auto-verifying payment {payment_id}")
+                logger.info(f"TEST MODE: Auto-verifying payment for token {token_id}")
+                
+                # Update token with actual payment ID (replacing order ID)
+                token.payment_id = payment_id
                 token.payment_status = PaymentStatus.COMPLETED
-                if not token.payment_id:
-                    token.payment_id = payment_id
                 db.commit()
+                
+                logger.info(f"✅ TEST MODE: Payment verified for token {token_id}")
                 return True
             
-            # PRODUCTION MODE
+            # PRODUCTION MODE - Verify signature
+            if not razorpay_signature:
+                logger.error("Razorpay signature missing for production verification")
+                return False
+            
             import razorpay
             
             client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
             
-            # Get order_id from token if not provided
-            if not order_id:
-                order_id = token.payment_id
+            # Verify signature
+            params_dict = {
+                'razorpay_order_id': order_id,
+                'razorpay_payment_id': payment_id,
+                'razorpay_signature': razorpay_signature
+            }
             
-            if not order_id:
-                raise ValueError("Order ID not found")
-            
-            # Verify signature if provided
-            if razorpay_signature:
-                params_dict = {
-                    'razorpay_payment_id': payment_id,
-                    'razorpay_order_id': order_id,
-                    'razorpay_signature': razorpay_signature
-                }
-                
-                logger.info(f"Verifying Razorpay signature for payment {payment_id}")
+            try:
                 client.utility.verify_payment_signature(params_dict)
-                logger.info("Signature verified successfully")
-            
-            # Fetch payment details
-            payment = client.payment.fetch(payment_id)
-            
-            if payment['status'] in ['captured', 'authorized']:
-                token.payment_status = PaymentStatus.COMPLETED
-                token.payment_id = payment_id
+                logger.info(f"✅ Razorpay signature verified for token {token_id}")
+            except razorpay.errors.SignatureVerificationError:
+                logger.error(f"❌ Razorpay signature verification failed for token {token_id}")
+                token.payment_status = PaymentStatus.FAILED
                 db.commit()
-                logger.info(f"Payment verified and completed: {payment_id}")
-                return True
-            else:
-                logger.warning(f"Payment not captured. Status: {payment['status']}")
                 return False
+            
+            # Update token with payment ID
+            token.payment_id = payment_id
+            token.payment_status = PaymentStatus.COMPLETED
+            db.commit()
+            
+            logger.info(f"✅ Payment verified and completed for token {token_id}")
+            return True
             
         except Exception as e:
             db.rollback()
-            logger.error(f"Payment verification failed: {str(e)}", exc_info=True)
-            token.payment_status = PaymentStatus.FAILED
-            db.commit()
+            logger.error(f"Payment verification error for token {token_id}: {str(e)}", exc_info=True)
             return False
     
     @staticmethod
@@ -256,7 +258,7 @@ class PaymentService:
             # TEST MODE
             if PaymentService._is_test_mode():
                 logger.info(f"TEST MODE: Auto-refunding payment token {token_id}")
-                refund_id = f"TEST_REFUND_{secrets.token_hex(8)}"
+                refund_id = f"rfnd_TEST_{secrets.token_hex(8)}"
                 token.mark_as_refunded(refund_id, reason)
                 db.commit()
                 return True

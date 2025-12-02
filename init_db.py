@@ -26,7 +26,7 @@ def init_database():
                 is_active=True,
                 is_verified=True,
                 is_subscribed=True,
-                credits_remaining=1000
+                free_credits_remaining=1000
             )
             db.add(admin)
             print("✓ Admin user created")

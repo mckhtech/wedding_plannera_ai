@@ -520,6 +520,11 @@
                 <div class="form-group">
                     <label for="displayOrder">Display Order</label>
                     <input type="number" id="displayOrder" value="0">
+                    <label>Price</label>
+                    <input type="number" step="0.01" id="templatePrice" required>
+                    <label>Currency</label>
+                    <input type="text" id="templateCurrency" value="USD" required>
+
                 </div>
                 <div class="form-group checkbox-group">
                     <input type="checkbox" id="isFree">
@@ -719,6 +724,7 @@
                                 <th>Description</th>
                                 <th>Status</th>
                                 <th>Free</th>
+                                <th>Price</th>
                                 <th>Usage</th>
                                 <th>Actions</th>
                             </tr>
@@ -742,7 +748,9 @@
                                 </span>
                             </td>
                             <td>${template.is_free ? '✅' : '❌'}</td>
+                            <td>${template.is_free ? 'Free' : `${template.price} ${template.currency}`}</td>
                             <td>${template.usage_count}</td>
+
                             <td>
                                 <div class="action-buttons">
                                     <button class="btn btn-primary btn-small" onclick="editTemplate(${template.id})">Edit</button>
@@ -967,6 +975,8 @@
                     document.getElementById('templateDescription').value = template.description;
                     document.getElementById('templatePrompt').value = template.prompt;
                     document.getElementById('displayOrder').value = template.display_order;
+                    document.getElementById('templatePrice').value = template.price ?? 0;
+                    document.getElementById('templateCurrency').value = template.currency ?? "INR";
                     document.getElementById('isFree').checked = template.is_free;
                     
                     if (template.preview_url) {
@@ -996,7 +1006,9 @@
             formData.append('prompt', document.getElementById('templatePrompt').value.trim());
             formData.append('display_order', document.getElementById('displayOrder').value);
             formData.append('is_free', document.getElementById('isFree').checked);
-            
+            formData.append('price', document.getElementById('templatePrice').value);
+            formData.append('currency', document.getElementById('templateCurrency').value.trim());
+
             const previewFile = document.getElementById('templatePreview').files[0];
             if (previewFile) {
                 formData.append('preview_image', previewFile);

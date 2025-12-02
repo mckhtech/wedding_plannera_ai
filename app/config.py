@@ -17,7 +17,8 @@ class Settings(BaseSettings):
     # Gemini API
     GEMINI_API_KEY: str
     
-    #razor pay
+    #razor 
+    PAYMENT_TEST_MODE: bool = False
     RAZORPAY_KEY_ID: str
     RAZORPAY_KEY_SECRET : str
     
