@@ -1,436 +1,488 @@
-import logging
-from google import genai
-from google.genai import types
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
+from fastapi.responses import HTMLResponse, FileResponse
+from sqlalchemy.orm import Session
+from typing import Optional
 from pathlib import Path
-import uuid
+from app.database import get_db
+from app.models.template import Template
+from app.models.user import User, AuthProvider
+from app.schemas.template import TemplateCreate, TemplateUpdate, TemplateResponse
+from app.schemas.auth import LoginRequest, TokenResponse
+from app.utils.dependencies import get_current_admin
+from app.services.storage_service import StorageService
+from app.services.auth_service import AuthService
 from app.config import settings
-from app.services.watermark_service import WatermarkService
-from PIL import Image
-from typing import Optional, List, Tuple
-from app.models.generation import GenerationMode
-import io
+from datetime import datetime
+import uuid
 
-logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api/admin", tags=["Admin"])
 
-class ImageGenerationService:
-    # Gemini API limits
-    MAX_IMAGE_SIZE_MB = 4  # Max 4MB per image
-    MAX_DIMENSION = 3072  # Max 3072px on any side
-    RECOMMENDED_DIMENSION = 1024  # Recommended for best results
+# ============= ADMIN LOGIN =============
+@router.post("/login", response_model=TokenResponse)
+async def admin_login(
+    login_data: LoginRequest,
+    db: Session = Depends(get_db)
+):
+    """Admin login endpoint - only for users with is_admin=True"""
     
-    # Target aspect ratio for phone
-    TARGET_ASPECT_WIDTH = 9
-    TARGET_ASPECT_HEIGHT = 16
+    # Authenticate user
+    user = AuthService.authenticate_user(db, login_data.email, login_data.password)
     
-    def __init__(self):
-        """Initialize Gemini client for image generation"""
-        if not settings.GEMINI_API_KEY:
-            logger.error("GEMINI_API_KEY not configured")
-            raise ValueError("GEMINI_API_KEY is required")
-            
-        self.api_key = settings.GEMINI_API_KEY
-        self.model_name = "gemini-2.5-flash-image"
-        logger.info(f"Image Generation Service initialized with model: {self.model_name}")
+    # Check if user is admin
+    if not user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied. Admin privileges required."
+        )
     
-    def _optimize_image(self, image_path: Path) -> Image.Image:
-        """
-        Optimize image for Gemini API:
-        - Convert to 9:16 ratio to force output ratio
-        - Resize if too large
-        - Compress if file size too big
-        """
-        img = Image.open(image_path)
-        original_size = image_path.stat().st_size / (1024 * 1024)  # MB
-        
-        logger.debug(f"Original image: {img.size}, {original_size:.2f}MB")
-        
-        # CRITICAL FIX: Convert to 9:16 ratio to force output ratio
-        target_ratio = self.TARGET_ASPECT_WIDTH / self.TARGET_ASPECT_HEIGHT
-        current_ratio = img.width / img.height
-        
-        if abs(current_ratio - target_ratio) > 0.01:
-            # Calculate new dimensions maintaining 9:16 ratio
-            if current_ratio > target_ratio:
-                # Image is too wide, crop width
-                new_width = int(img.height * target_ratio)
-                left = (img.width - new_width) // 2
-                img = img.crop((left, 0, left + new_width, img.height))
-            else:
-                # Image is too tall, crop height
-                new_height = int(img.width / target_ratio)
-                top = (img.height - new_height) // 2
-                img = img.crop((0, top, img.width, top + new_height))
-            
-            logger.debug(f"Cropped to 9:16 ratio: {img.size}")
-        
-        # Resize if dimensions too large (maintain 9:16)
-        if max(img.size) > self.RECOMMENDED_DIMENSION:
-            # Scale down maintaining 9:16 ratio
-            if img.width > img.height:
-                new_height = self.RECOMMENDED_DIMENSION
-                new_width = int(new_height * target_ratio)
-            else:
-                new_height = self.RECOMMENDED_DIMENSION
-                new_width = int(new_height * target_ratio)
-            
-            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            logger.debug(f"Resized to: {img.size}")
-        
-        # Compress if file size too large
-        if original_size > self.MAX_IMAGE_SIZE_MB:
-            buffer = io.BytesIO()
-            quality = 85
-            
-            while quality > 20:
-                buffer.seek(0)
-                buffer.truncate()
-                img.save(buffer, format='JPEG', quality=quality, optimize=True)
-                size_mb = buffer.tell() / (1024 * 1024)
-                
-                if size_mb <= self.MAX_IMAGE_SIZE_MB:
-                    break
-                quality -= 10
-            
-            buffer.seek(0)
-            img = Image.open(buffer)
-            logger.debug(f"Compressed to: {size_mb:.2f}MB at quality {quality}")
-        
-        # Convert RGBA to RGB if needed
-        if img.mode == 'RGBA':
-            background = Image.new('RGB', img.size, (255, 255, 255))
-            background.paste(img, mask=img.split()[3])
-            img = background
-            logger.debug("Converted RGBA to RGB")
-        
-        return img
+    # Create access token
+    access_token = AuthService.create_token(user)
     
-    async def generate_image(
-        self, 
-        generation_mode: GenerationMode,
-        user_images: Optional[List[str]] = None,
-        partner_images: Optional[List[str]] = None,
-        couple_image_path: Optional[str] = None,
-        prompt: str = "",
-        add_watermark: bool = False
-    ) -> Tuple[str, Optional[str]]:
-        """
-        Generate image using Gemini API with robust error handling
-        """
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "full_name": user.full_name,
+            "is_admin": user.is_admin
+        }
+    }
+
+# ============= TEMPLATE MANAGEMENT =============
+@router.post("/templates", response_model=TemplateResponse, status_code=status.HTTP_201_CREATED)
+async def create_template(
+    name: str = Form(...),
+    description: str = Form(...),
+    prompt: str = Form(...),
+    is_free: bool = Form(False),
+    display_order: int = Form(0),
+    price: Optional[float] = Form(0.0),           # ← ADD THIS
+    currency: Optional[str] = Form("INR"),
+    preview_image: Optional[UploadFile] = File(None),
+    current_admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db)
+):
+    """Create a new template with optional preview image (Admin only)"""
+    
+    print(f"Creating template: name={name}, description={description}, prompt={prompt}")
+    
+    # Check if template name already exists
+    existing = db.query(Template).filter(Template.name == name).first()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Template with this name already exists"
+        )
+    
+    # Handle preview image upload
+    preview_image_path = None
+    if preview_image and preview_image.filename:
         try:
-            logger.info(f"🚀 Starting image generation - Mode: {generation_mode}")
-            
-            # Prepare content based on mode
-            if generation_mode == GenerationMode.FLEXIBLE:
-                contents, full_prompt = self._prepare_flexible_mode(
-                    user_images, partner_images, prompt
-                )
-            elif generation_mode == GenerationMode.COUPLE:
-                contents, full_prompt = self._prepare_couple_mode(
-                    couple_image_path, prompt
-                )
-            else:
-                raise ValueError(f"Invalid generation mode: {generation_mode}")
-            
-            # Log prompt length
-            prompt_length = len(full_prompt)
-            logger.info(f"📝 Prompt length: {prompt_length} characters")
-            
-            # Initialize Gemini client
-            client = genai.Client(api_key=self.api_key)
-            
-            # Configure generation - PHONE RATIO (9:16)
-            config = types.GenerateContentConfig(
-                response_modalities=["IMAGE"],
-                image_config=types.ImageConfig(aspect_ratio="9:16")
+            StorageService.validate_image_file(preview_image)
+            preview_image_path = await StorageService.save_upload_file(
+                preview_image, 
+                settings.TEMPLATE_PREVIEW_DIR
             )
-            
-            logger.info(f"📤 Sending request to Gemini API with 9:16 ratio...")
-            
-            # Generate image with retry logic
-            max_retries = 2
-            for attempt in range(max_retries):
-                try:
-                    response = client.models.generate_content(
-                        model=self.model_name,
-                        contents=contents,
-                        config=config
-                    )
-                    logger.info("📥 Gemini API response received")
-                    break
-                    
-                except Exception as api_error:
-                    error_msg = str(api_error)
-                    
-                    # Handle specific errors
-                    if "500" in error_msg or "INTERNAL" in error_msg:
-                        if attempt < max_retries - 1:
-                            logger.warning(f"⚠️ Gemini 500 error (attempt {attempt+1}/{max_retries}), retrying...")
-                            continue
-                        else:
-                            raise Exception(
-                                "Gemini API is experiencing issues. This is typically due to: "
-                                "(1) Image complexity, (2) API overload, or (3) Prompt length. "
-                                "Please try again with fewer/smaller images or a simpler prompt."
-                            )
-                    
-                    elif "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
-                        raise Exception(
-                            "Rate limit exceeded. Please wait a moment before trying again."
-                        )
-                    
-                    elif "400" in error_msg or "INVALID_ARGUMENT" in error_msg:
-                        raise Exception(
-                            "Invalid request. Check that all images are valid and under 4MB."
-                        )
-                    
-                    else:
-                        raise Exception(f"Gemini API error: {error_msg}")
-            
-            # Save generated image
-            generated_path = self._save_generated_image(response)
-            
-            # Add watermark if requested
-            watermarked_path = None
-            if add_watermark:
-                watermarked_path = self._add_watermark(generated_path)
-            
-            logger.info("✅ Image generation completed successfully")
-            return str(generated_path), watermarked_path
-            
+            print(f"Saved preview image: {preview_image_path}")
         except Exception as e:
-            logger.error(f"❌ Image generation failed: {str(e)}", exc_info=True)
-            raise Exception(f"Image generation failed: {str(e)}")
+            print(f"Error saving preview image: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to save preview image: {str(e)}"
+            )
     
-    def _prepare_flexible_mode(
-        self, 
-        user_images: List[str], 
-        partner_images: List[str],
-        prompt: str
-    ) -> Tuple[list, str]:
-        """Prepare content for FLEXIBLE mode with optimization"""
-        logger.info(f"Preparing FLEXIBLE mode: {len(user_images)} user + {len(partner_images)} partner images")
-        
-        # Load and optimize user images (ALL converted to 9:16)
-        user_pil_images = []
-        for i, path in enumerate(user_images, 1):
-            img_path = self._validate_and_get_path(path, f"User {i}")
-            pil_img = self._optimize_image(img_path)
-            user_pil_images.append(pil_img)
-            logger.debug(f"✓ User image {i} optimized to 9:16: {pil_img.size}")
-        
-        # Load and optimize partner images (ALL converted to 9:16)
-        partner_pil_images = []
-        for i, path in enumerate(partner_images, 1):
-            img_path = self._validate_and_get_path(path, f"Partner {i}")
-            pil_img = self._optimize_image(img_path)
-            partner_pil_images.append(pil_img)
-            logger.debug(f"✓ Partner image {i} optimized to 9:16: {pil_img.size}")
-        
-        # Create optimized prompt
-        full_prompt = self._create_flexible_prompt(
-            prompt, 
-            len(user_images), 
-            len(partner_images)
+    # Create template
+    try:
+        template = Template(
+            name=name,
+            description=description,
+            prompt=prompt,
+            preview_image=preview_image_path,
+            is_free=is_free,
+            display_order=display_order,
+            price=price,                 # ← ADD THIS
+            currency=currency
         )
         
-        # Build contents
-        contents = [full_prompt] + user_pil_images + partner_pil_images
+        db.add(template)
+        db.commit()
+        db.refresh(template)
         
-        return contents, full_prompt
+        print(f"Template created successfully: {template.id}")
+        return template
+    except Exception as e:
+        db.rollback()
+        print(f"Error creating template: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create template: {str(e)}"
+        )
+
+@router.put("/templates/{template_id}", response_model=TemplateResponse)
+async def update_template(
+    template_id: int,
+    name: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    prompt: Optional[str] = Form(None),
+    is_free: Optional[bool] = Form(None),
+    price: Optional[float] = Form(None),         # ← ADD THIS
+    currency: Optional[str] = Form(None),        # ← ADD THIS
+    display_order: Optional[int] = Form(None),
+    is_active: Optional[bool] = Form(None),
+    preview_image: Optional[UploadFile] = File(None),
+    current_admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db)
+):
+    """Update a template (Admin only)"""
     
-    def _prepare_couple_mode(
-        self,
-        couple_image_path: str,
-        prompt: str
-    ) -> Tuple[list, str]:
-        """Prepare content for COUPLE mode with optimization"""
-        logger.info("Preparing COUPLE mode generation")
-        
-        couple_path = self._validate_and_get_path(couple_image_path, "Couple")
-        couple_image = self._optimize_image(couple_path)
-        logger.debug(f"✓ Couple image optimized to 9:16: {couple_image.size}")
-        
-        full_prompt = self._create_couple_prompt(prompt)
-        contents = [full_prompt, couple_image]
-        
-        return contents, full_prompt
+    template = db.query(Template).filter(Template.id == template_id).first()
+    if not template:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Template not found"
+        )
     
-    def _validate_and_get_path(self, file_path: str, label: str) -> Path:
-        """Validate file exists and return Path object"""
-        path = Path(file_path)
-        if not path.exists():
-            raise FileNotFoundError(f"{label} image not found at: {file_path}")
-        return path
+    # Update fields
+    if name is not None:
+        template.name = name
+    if description is not None:
+        template.description = description
+    if prompt is not None:
+        template.prompt = prompt
+    if is_free is not None:
+        template.is_free = is_free
+    if display_order is not None:
+        template.display_order = display_order
+    if is_active is not None:
+        template.is_active = is_active
+        
+    if price is not None:         # ← ADD THIS
+        template.price = price
+    if currency is not None:      # ← ADD THIS
+        template.currency = currency
     
-    def _save_generated_image(self, response) -> Path:
-        """Save generated image from API response"""
-        if not response.candidates or not response.candidates[0].content.parts:
-            raise Exception("No valid response from Gemini API")
+    # Handle preview image update
+    if preview_image and preview_image.filename:
+        # Delete old preview if exists
+        if template.preview_image:
+            try:
+                StorageService.delete_file(template.preview_image)
+            except Exception as e:
+                print(f"Error deleting old preview: {e}")
         
-        part = response.candidates[0].content.parts[0]
-        if not hasattr(part, 'inline_data') or not part.inline_data:
-            raise Exception("No inline image data found in response")
-        
-        # Create output directory
-        generated_dir = Path(settings.GENERATED_DIR)
-        generated_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save image
-        generated_filename = f"{uuid.uuid4()}.png"
-        generated_path = generated_dir / generated_filename
-        
-        generated_image = part.as_image()
-        generated_image.save(str(generated_path))
-        
-        # Log final dimensions
-        logger.info(f"💾 Image saved: {generated_path} ({generated_image.size})")
-        return generated_path
-        
-    def _add_watermark(self, image_path: Path) -> str:
-        """Add watermark to generated image"""
+        # Upload new preview
         try:
-            generated_dir = Path(settings.GENERATED_DIR)
-            watermarked_filename = f"{uuid.uuid4()}_watermarked.png"
-            watermarked_path = str(generated_dir / watermarked_filename)
-            
-            WatermarkService.add_watermark(
-                str(image_path),
-                watermarked_path,
-                settings.WATERMARK_TEXT
+            StorageService.validate_image_file(preview_image)
+            new_preview_path = await StorageService.save_upload_file(
+                preview_image,
+                settings.TEMPLATE_PREVIEW_DIR
             )
-            
-            logger.info(f"🖼️ Watermark added: {watermarked_path}")
-            return watermarked_path
-            
+            template.preview_image = new_preview_path
         except Exception as e:
-            logger.error(f"❌ Watermark addition failed: {str(e)}")
-            return str(image_path)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to save preview image: {str(e)}"
+            )
     
-    def _create_flexible_prompt(
-        self, 
-        template_prompt: str, 
-        user_count: int,
-        partner_count: int
-    ) -> str:
-        """
-        ENHANCED for maximum face and body accuracy
-        """
-        
-        # Build reference description
-        if user_count == 1 and partner_count == 1:
-            ref_text = "First image = Person A, Second image = Person B"
-        else:
-            ref_text = f"Images 1-{user_count} = Person A, Images {user_count+1}-{user_count+partner_count} = Person B"
-        
-        return f"""REFERENCE IMAGES: {ref_text}
+    try:
+        db.commit()
+        db.refresh(template)
+        return template
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update template: {str(e)}"
+        )
 
-TASK: Create a photorealistic pre-wedding portrait using the EXACT people from reference images.
+@router.delete("/templates/{template_id}")
+async def delete_template(
+    template_id: int,
+    current_admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db)
+):
+    """Archive a template (Admin only) - Soft delete to archive"""
+    
+    template = db.query(Template).filter(Template.id == template_id).first()
+    if not template:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Template not found"
+        )
+    
+    # Check if already archived
+    if template.is_archived:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Template is already archived"
+        )
+    
+    # Archive the template
+    template.is_archived = True
+    template.archived_at = datetime.utcnow()
+    template.is_active = False  # Also deactivate
+    
+    try:
+        db.commit()
+        return {
+            "message": "Template archived successfully",
+            "template_id": template_id,
+            "archived_at": template.archived_at
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to archive template: {str(e)}"
+        )
 
-CRITICAL FACE ACCURACY RULES:
-1. FACIAL STRUCTURE: Copy exact bone structure, face shape (round/oval/square), jawline definition, chin shape, forehead width and height
-2. EYES: Match exact eye shape, size, spacing between eyes, eyelid shape, eyebrow thickness and arch, eye color depth
-3. NOSE: Preserve exact nose bridge width, nostril shape and size, nose tip shape, nose length and projection
-4. MOUTH: Copy exact lip thickness (upper and lower), lip width, mouth corner shape, teeth visibility when smiling
-5. SKIN: Maintain exact skin tone, undertones (warm/cool), natural texture, pores, any moles, freckles, or birthmarks, natural shadows and contours
-6. HAIR: Match exact hair color, texture (straight/wavy/curly), hairline shape, volume, styling direction
-7. ETHNICITY: Preserve all ethnic facial characteristics - NO westernization or generic features
-8. ASYMMETRY: Keep natural facial asymmetries - faces are NOT perfectly symmetrical
-9. AGE MARKERS: Maintain natural age-appropriate features - laugh lines, under-eye area, skin elasticity
+@router.post("/templates/{template_id}/restore")
+async def restore_template(
+    template_id: int,
+    current_admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db)
+):
+    """Restore an archived template (Admin only)"""
+    
+    template = db.query(Template).filter(Template.id == template_id).first()
+    if not template:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Template not found"
+        )
+    
+    if not template.is_archived:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Template is not archived"
+        )
+    
+    # Restore the template
+    template.is_archived = False
+    template.archived_at = None
+    template.is_active = True  # Reactivate
+    
+    try:
+        db.commit()
+        db.refresh(template)
+        return {
+            "message": "Template restored successfully",
+            "template": template
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to restore template: {str(e)}"
+        )
 
-BODY ACCURACY RULES:
-1. BODY PROPORTIONS: Match exact height difference between Person A and Person B (if visible in references)
-2. BUILD: Preserve body type - slim/athletic/average/heavy build for each person
-3. SHOULDERS: Match shoulder width relative to head size
-4. POSTURE: Natural, relaxed posture - no stiff or unnatural poses
-5. HANDS: Anatomically correct hands with EXACTLY 5 fingers per hand, natural hand size proportional to body, realistic knuckles and skin texture
-6. SKIN TONE CONSISTENCY: Body skin tone must match face skin tone exactly
+@router.delete("/templates/{template_id}/permanent")
+async def permanently_delete_template(
+    template_id: int,
+    current_admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db)
+):
+    """Permanently delete a template (Admin only) - Can only delete archived templates"""
+    
+    template = db.query(Template).filter(Template.id == template_id).first()
+    if not template:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Template not found"
+        )
+    
+    # Only allow permanent deletion of archived templates
+    if not template.is_archived:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Template must be archived before permanent deletion. Archive it first."
+        )
+    
+    # Delete preview image if exists
+    if template.preview_image:
+        try:
+            StorageService.delete_file(template.preview_image)
+        except Exception as e:
+            print(f"Error deleting preview image: {e}")
+    
+    # Permanently delete from database
+    try:
+        db.delete(template)
+        db.commit()
+        return {
+            "message": "Template permanently deleted",
+            "template_id": template_id
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to permanently delete template: {str(e)}"
+        )
 
-SCENE DESCRIPTION: {template_prompt}
+@router.get("/templates/all")
+async def get_all_templates_admin(
+    include_inactive: bool = False,
+    show_archived: bool = False,
+    current_admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db)
+):
+    """Get all templates (Admin only) - Excludes archived by default"""
+    
+    query = db.query(Template)
+    
+    # By default, exclude archived templates
+    if not show_archived:
+        query = query.filter(Template.is_archived == False)
+    
+    # Filter by active status
+    if not include_inactive and not show_archived:
+        query = query.filter(Template.is_active == True)
+    
+    templates = query.order_by(Template.display_order).all()
+    
+    # Add full URL for preview images
+    templates_data = []
+    for template in templates:
+        template_dict = {
+            "id": template.id,
+            "name": template.name,
+            "description": template.description,
+            "prompt": template.prompt,
+            "preview_image": template.preview_image,
+            "preview_url": StorageService.get_file_url(template.preview_image) if template.preview_image else None,
+            "is_free": template.is_free,
+            "is_active": template.is_active,
+            "price":template.price,
+            "currency":template.currency,
+            "is_archived": template.is_archived,
+            "archived_at": template.archived_at,
+            "display_order": template.display_order,
+            "usage_count": template.usage_count,
+            "created_at": template.created_at,
+            "updated_at": template.updated_at
+        }
+        templates_data.append(template_dict)
+    
+    return {
+        "templates": templates_data,
+        "total": len(templates_data)
+    }
 
-COMPOSITION & FORMAT:
-- Vertical phone format (9:16 aspect ratio)
-- Full body or 3/4 length composition showing both people
-- Professional pre-wedding photography composition
-- Both faces clearly visible and in sharp focus
-- Natural, romantic interaction between the couple
+@router.get("/templates/archived")
+async def get_archived_templates(
+    current_admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db)
+):
+    """Get all archived templates (Admin only)"""
+    
+    templates = db.query(Template).filter(
+        Template.is_archived == True
+    ).order_by(Template.archived_at.desc()).all()
+    
+    # Add full URL for preview images
+    templates_data = []
+    for template in templates:
+        template_dict = {
+            "id": template.id,
+            "name": template.name,
+            "description": template.description,
+            "prompt": template.prompt,
+            "preview_image": template.preview_image,
+            "preview_url": StorageService.get_file_url(template.preview_image) if template.preview_image else None,
+            "is_free": template.is_free,
+            "is_active": template.is_active,
+            "price":template.price,
+            "currency":template.currency,
+            "is_archived": template.is_archived,
+            "archived_at": template.archived_at,
+            "display_order": template.display_order,
+            "usage_count": template.usage_count,
+            "created_at": template.created_at,
+            "updated_at": template.updated_at
+        }
+        templates_data.append(template_dict)
+    
+    return {
+        "templates": templates_data,
+        "total": len(templates_data)
+    }
 
-TECHNICAL REQUIREMENTS:
-- Ultra-photorealistic rendering, NOT artistic or stylized
-- Professional DSLR photography quality
-- Natural lighting with soft shadows
-- Sharp focus on faces, slight depth of field on background
-- High detail on faces (8K quality), skin pores visible
-- Natural color grading - warm, romantic but realistic tones
+# ============= STATISTICS =============
+@router.get("/stats")
+async def get_admin_stats(
+    current_admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db)
+):
+    """Get admin dashboard statistics"""
+    from app.models.generation import Generation
+    
+    total_users = db.query(User).count()
+    total_generations = db.query(Generation).count()
+    total_templates = db.query(Template).filter(
+        Template.is_active == True,
+        Template.is_archived == False
+    ).count()
+    subscribed_users = db.query(User).filter(User.is_subscribed == True).count()
+    archived_templates = db.query(Template).filter(Template.is_archived == True).count()
+    
+    return {
+        "total_users": total_users,
+        "total_generations": total_generations,
+        "total_templates": total_templates,
+        "subscribed_users": subscribed_users,
+        "archived_templates": archived_templates
+    }
 
-ABSOLUTE PROHIBITIONS:
-- DO NOT apply beauty filters, face smoothing, or skin retouching
-- DO NOT change any facial features from references
-- DO NOT create generic "AI pretty faces"
-- DO NOT add makeup unless visible in reference images
-- DO NOT create extra fingers (must be EXACTLY 5 per hand)
-- DO NOT create deformed, twisted, or unnatural hands
-- DO NOT blur faces or create out-of-focus faces
-- DO NOT cross eyes or create misaligned eyes
-- DO NOT change body proportions or height differences
-- DO NOT create cartoonish or anime-style features
+# ============= USER MANAGEMENT =============
+@router.get("/users")
+async def get_all_users(
+    skip: int = 0,
+    limit: int = 100,
+    current_admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db)
+):
+    """Get all users (Admin only)"""
+    users = db.query(User).offset(skip).limit(limit).all()
+    return {
+        "users": users,
+        "total": db.query(User).count()
+    }
 
-FINAL OUTPUT: A professional, photorealistic pre-wedding portrait in vertical phone format with the EXACT faces and bodies from reference images placed naturally in the described scene."""
-            
-    def _create_couple_prompt(self, template_prompt: str) -> str:
-        """
-        ENHANCED for couple mode - maximum face and body accuracy
-        """
-        return f"""REFERENCE IMAGE: One image showing both people together.
+@router.post("/users/{user_id}/grant-credits")
+async def grant_credits(
+    user_id: int,
+    credits: int,
+    current_admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db)
+):
+    """Grant credits to a user (Admin only)"""
+    
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    user.credits_remaining += credits
+    db.commit()
+    
+    return {
+        "message": f"Granted {credits} credits to user",
+        "user_id": user.id,
+        "user_email": user.email,
+        "new_balance": user.credits_remaining
+    }
 
-TASK: Create a photorealistic pre-wedding portrait preserving the EXACT appearance and relationship of both people.
-
-CRITICAL FACE ACCURACY RULES:
-1. FACIAL STRUCTURE: Copy exact bone structure, face shape, jawline, chin shape, forehead for BOTH people
-2. EYES: Match exact eye shape, size, spacing, eyelid shape, eyebrow style, eye color for each person
-3. NOSE: Preserve exact nose bridge, nostril shape, nose tip, length for each person
-4. MOUTH: Copy exact lip thickness, width, mouth shape, smile characteristics for each person
-5. SKIN: Maintain exact skin tone, texture, any moles, freckles, natural contours for both people
-6. HAIR: Match exact hair color, texture, hairline, volume, styling for each person
-7. ETHNICITY: Preserve all ethnic characteristics for both people - NO generic features
-8. ASYMMETRY: Keep natural facial asymmetries for both faces
-9. AGE MARKERS: Maintain age-appropriate features for both people
-
-RELATIONSHIP & BODY ACCURACY:
-1. HEIGHT DIFFERENCE: Preserve exact height difference between the two people as shown in reference
-2. BODY BUILD: Match body type and build for each person (slim/athletic/average/heavy)
-3. PROPORTIONS: Keep body proportions (shoulder width, torso length) for each person
-4. RELATIVE SIZE: Maintain correct relative sizing - who is taller, broader, etc.
-5. HANDS: Anatomically correct hands with EXACTLY 5 fingers per hand for both people
-6. SKIN TONE: Body skin tone must match face skin tone for each person
-7. POSTURE: Natural, comfortable poses showing their real relationship dynamic
-
-SCENE DESCRIPTION: {template_prompt}
-
-COMPOSITION & FORMAT:
-- Vertical phone format (9:16 aspect ratio)
-- Full body or 3/4 length showing both people clearly
-- Professional pre-wedding photography composition
-- Both faces clearly visible and in sharp focus
-- Maintain their natural chemistry and body language from reference
-
-TECHNICAL REQUIREMENTS:
-- Ultra-photorealistic rendering, NOT artistic interpretation
-- Professional DSLR photography quality
-- Natural, romantic lighting with soft shadows
-- Sharp focus on both faces with visible skin detail
-- High resolution (8K quality) with natural pores and texture
-- Warm, romantic color grading but realistic tones
-
-ABSOLUTE PROHIBITIONS:
-- DO NOT apply beauty filters or face smoothing to either person
-- DO NOT change facial features of either person
-- DO NOT make faces more "attractive" or generic
-- DO NOT alter height difference or body proportions
-- DO NOT create extra fingers (must be EXACTLY 5 per hand for both)
-- DO NOT create deformed, twisted, or unnatural hands
-- DO NOT blur either face or create soft focus on faces
-- DO NOT cross eyes or misalign eyes on either person
-- DO NOT change the relationship dynamic or chemistry
-- DO NOT add makeup unless visible in reference
-
-FINAL OUTPUT: A professional, photorealistic pre-wedding portrait in vertical phone format with the EXACT appearance, proportions, and relationship of both people from the reference image placed naturally in the described scene."""
+# ============= ADMIN DASHBOARD PAGE =============
+@router.get("/dashboard", response_class=HTMLResponse)
+async def admin_dashboard():
+    """Serve the admin dashboard HTML page"""
+    dashboard_path = Path(__file__).parent.parent / "templates" / "admin_dashboard.html"
+    
+    if not dashboard_path.exists():
+        raise HTTPException(status_code=404, detail="Admin dashboard not found")
+    
+    return FileResponse(dashboard_path)
