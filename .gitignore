@@ -8,6 +8,6 @@ alembic
 venv/
 alembic.ini
 uploads/
-template_previews/
+templates/
 generated/
 instance/
