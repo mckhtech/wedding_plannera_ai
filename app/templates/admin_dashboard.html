@@ -719,6 +719,7 @@
                     <table>
                         <thead>
                             <tr>
+                                <th>Display Order</th>
                                 <th>Preview</th>
                                 <th>Name</th>
                                 <th>Description</th>
@@ -735,6 +736,7 @@
                 data.templates.forEach(template => {
                     html += `
                         <tr>
+                            <td><strong>${template.display_order ?? 0}</strong></td>
                             <td>
                                 ${template.preview_url 
                                     ? `<img src="${template.preview_url}" class="template-preview" alt="${template.name}">` 
@@ -742,6 +744,7 @@
                             </td>
                             <td><strong>${template.name}</strong></td>
                             <td>${template.description}</td>
+
                             <td>
                                 <span class="badge ${template.is_active ? 'badge-success' : 'badge-danger'}">
                                     ${template.is_active ? 'Active' : 'Inactive'}

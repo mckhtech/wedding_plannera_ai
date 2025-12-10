@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     BASIC_PLAN_PRICE: int = 20000
     BASIC_PLAN_CREDITS: int = 20
     
+    REDIS_URL: str = "redis://localhost:6379/0"
+    
     class Config:
         env_file = ".env"
         case_sensitive = True
