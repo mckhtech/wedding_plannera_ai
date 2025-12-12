@@ -1,16 +1,34 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 from pathlib import Path
-import os
-from app.config import settings
-from app.database import engine, Base
-from app.api import auth, templates, generation, admin, test, payment , test_payment
-import app.models
 import logging
+import sys
+from contextlib import asynccontextmanager
+
+from app.config import settings
+from app.database import engine, Base, check_db_connection, get_pool_status
+from app.api import auth, templates, generation, admin, test, payment, test_payment
+import app.models
+
+# ============================================
+# LOGGING CONFIGURATION
+# ============================================
+
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('app.log') if settings.is_production else logging.NullHandler()
+    ]
+)
 
 logger = logging.getLogger(__name__)
+
 Base.metadata.create_all(bind=engine)
 
 Path(settings.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)

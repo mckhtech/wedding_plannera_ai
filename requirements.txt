@@ -20,7 +20,6 @@ google-auth-oauthlib==1.2.0
 google-auth-httplib2==0.2.0
 websockets==12.0
 alembic
-
 google-genai
 Pillow
 python-dotenv
@@ -28,3 +27,4 @@ razorpay
 requests
 celery
 flower
+boto3

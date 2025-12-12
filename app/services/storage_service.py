@@ -5,11 +5,17 @@ import logging
 from pathlib import Path
 from fastapi import UploadFile, HTTPException, Request
 from app.config import settings
+from app.services.s3_service import s3_service
 from typing import Optional
+import tempfile
 
 logger = logging.getLogger(__name__)
 
 class StorageService:
+    """
+    Unified storage service supporting both local and S3 storage
+    Automatically switches based on USE_S3 setting
+    """
     
     # Allowed file extensions and their MIME types
     ALLOWED_IMAGE_TYPES = {
@@ -22,14 +28,14 @@ class StorageService:
     @staticmethod
     async def save_upload_file(file: UploadFile, folder: str = "uploads") -> str:
         """
-        Save uploaded file and return the file path
+        Save uploaded file to S3 or local storage
         
         Args:
             file: Uploaded file object
-            folder: Target folder ("uploads" or "generated")
+            folder: Target folder ("uploads", "generated", or "template_previews")
             
         Returns:
-            str: Absolute path to saved file
+            str: S3 URL or local file path
             
         Raises:
             HTTPException: If file save fails
@@ -38,42 +44,94 @@ class StorageService:
             # Validate file first
             StorageService.validate_image_file(file)
             
-            # Determine directory
-            upload_dir = Path(settings.UPLOAD_DIR if folder == "uploads" else settings.GENERATED_DIR)
-            upload_dir.mkdir(parents=True, exist_ok=True)
+            # Read file content
+            content = await file.read()
             
-            # Generate unique filename
-            file_extension = os.path.splitext(file.filename)[1].lower()
-            unique_filename = f"{uuid.uuid4()}{file_extension}"
-            file_path = upload_dir / unique_filename
-            
-            # Save file
-            async with aiofiles.open(file_path, 'wb') as out_file:
-                content = await file.read()
-                await out_file.write(content)
-            
-            logger.info(f"File saved successfully: {file_path} ({len(content)} bytes)")
-            return str(file_path)
+            if settings.USE_S3:
+                # Upload to S3
+                from io import BytesIO
+                file_obj = BytesIO(content)
+                
+                s3_url = s3_service.upload_fileobj(
+                    file_obj=file_obj,
+                    filename=file.filename,
+                    folder=folder
+                )
+                
+                logger.info(f"✅ File uploaded to S3: {s3_url}")
+                return s3_url
+                
+            else:
+                # Save locally
+                upload_dir = Path(settings.UPLOAD_DIR if folder == "uploads" else settings.GENERATED_DIR)
+                if folder == "template_previews":
+                    upload_dir = Path(settings.TEMPLATE_PREVIEW_DIR)
+                    
+                upload_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Generate unique filename
+                file_extension = os.path.splitext(file.filename)[1].lower()
+                unique_filename = f"{uuid.uuid4()}{file_extension}"
+                file_path = upload_dir / unique_filename
+                
+                # Save file
+                async with aiofiles.open(file_path, 'wb') as out_file:
+                    await out_file.write(content)
+                
+                logger.info(f"✅ File saved locally: {file_path} ({len(content)} bytes)")
+                return str(file_path)
             
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"Failed to save file: {str(e)}", exc_info=True)
+            logger.error(f"❌ Failed to save file: {str(e)}", exc_info=True)
             raise HTTPException(
                 status_code=500, 
                 detail=f"Failed to save file: {str(e)}"
             )
     
     @staticmethod
-    def get_file_url(file_path: Optional[str], request: Optional[Request] = None) -> Optional[str]:
+    def save_generated_image(image_path: str, folder: str = "generated") -> str:
         """
-        Convert file path to URL
-        
-        Handles both forward slashes and backslashes (Windows paths)
-        Supports ngrok tunnels and localhost
+        Upload already-generated local image to S3
         
         Args:
-            file_path: Local file path
+            image_path: Local path to generated image
+            folder: S3 folder prefix
+            
+        Returns:
+            str: S3 URL or local path
+        """
+        if not settings.USE_S3:
+            return image_path
+        
+        try:
+            s3_url = s3_service.upload_file(
+                file_path=image_path,
+                folder=folder
+            )
+            
+            # Optionally delete local file after upload
+            try:
+                Path(image_path).unlink()
+                logger.debug(f"🗑️ Deleted local file after S3 upload: {image_path}")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not delete local file: {e}")
+            
+            return s3_url
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to upload generated image to S3: {e}")
+            # Fallback to local path if S3 fails
+            return image_path
+    
+    @staticmethod
+    def get_file_url(file_path: Optional[str], request: Optional[Request] = None) -> Optional[str]:
+        """
+        Convert file path/URL to accessible URL
+        
+        Args:
+            file_path: S3 URL or local file path
             request: FastAPI request object (optional, for dynamic base URL)
             
         Returns:
@@ -83,7 +141,15 @@ class StorageService:
             return None
         
         try:
-            # Normalize path separators
+            # If already a full URL (S3), return as-is
+            if file_path.startswith('http'):
+                return file_path
+            
+            if settings.USE_S3:
+                # Generate S3 URL
+                return s3_service.get_file_url(file_path)
+            
+            # Local storage - generate local URL
             normalized_path = file_path.replace('\\', '/')
             
             # Remove leading "./"
@@ -116,26 +182,15 @@ class StorageService:
     @staticmethod
     def delete_file(file_path: str) -> bool:
         """
-        Delete a file from storage
+        Delete a file from S3 or local storage
         
         Args:
-            file_path: Path to file
+            file_path: S3 URL or local path
             
         Returns:
             bool: True if deleted, False otherwise
         """
-        try:
-            path = Path(file_path)
-            if path.exists():
-                path.unlink()
-                logger.info(f"File deleted: {file_path}")
-                return True
-            else:
-                logger.warning(f"File not found for deletion: {file_path}")
-                return False
-        except Exception as e:
-            logger.error(f"Failed to delete file {file_path}: {str(e)}")
-            return False
+        return s3_service.delete_file(file_path)
     
     @staticmethod
     def validate_image_file(file: UploadFile) -> bool:
@@ -187,26 +242,20 @@ class StorageService:
     @staticmethod
     def file_exists(file_path: str) -> bool:
         """
-        Check if file exists
+        Check if file exists in S3 or locally
         
         Args:
-            file_path: Path to file
+            file_path: S3 URL or local path
             
         Returns:
             bool: True if exists
         """
-        try:
-            exists = Path(file_path).exists()
-            logger.debug(f"File existence check for {file_path}: {exists}")
-            return exists
-        except Exception as e:
-            logger.error(f"Error checking file existence: {str(e)}")
-            return False
+        return s3_service.file_exists(file_path)
     
     @staticmethod
     def get_file_size(file_path: str) -> Optional[int]:
         """
-        Get file size in bytes
+        Get file size in bytes (local only for now)
         
         Args:
             file_path: Path to file
@@ -214,6 +263,10 @@ class StorageService:
         Returns:
             Optional[int]: File size in bytes or None if error
         """
+        if settings.USE_S3:
+            logger.warning("get_file_size not implemented for S3 yet")
+            return None
+            
         try:
             size = Path(file_path).stat().st_size
             logger.debug(f"File size for {file_path}: {size} bytes")
@@ -225,7 +278,8 @@ class StorageService:
     @staticmethod
     def cleanup_old_files(directory: str, max_age_days: int = 7) -> int:
         """
-        Clean up old files from directory (useful for scheduled cleanup)
+        Clean up old files from local directory
+        (S3 cleanup handled by lifecycle policies)
         
         Args:
             directory: Directory to clean
@@ -234,6 +288,10 @@ class StorageService:
         Returns:
             int: Number of files deleted
         """
+        if settings.USE_S3:
+            logger.info("S3 cleanup handled by lifecycle policies")
+            return 0
+            
         try:
             import time
             

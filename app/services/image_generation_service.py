@@ -5,6 +5,7 @@ from pathlib import Path
 import uuid
 from app.config import settings
 from app.services.watermark_service import WatermarkService
+from app.services.storage_service import StorageService
 from PIL import Image
 from typing import Optional, List, Tuple
 from app.models.generation import GenerationMode
@@ -32,15 +33,21 @@ class ImageGenerationService:
         self.model_name = "gemini-2.5-flash-image"
         logger.info(f"Image Generation Service initialized with model: {self.model_name}")
     
-    def _optimize_image(self, image_path: Path) -> Image.Image:
+    def _optimize_image(self, image_path: str) -> Image.Image:
         """
-        Optimize image for Gemini API:
-        - Convert to 9:16 ratio to force output ratio
-        - Resize if too large
-        - Compress if file size too big
+        Optimize image for Gemini API - supports both local paths and S3 URLs
         """
-        img = Image.open(image_path)
-        original_size = image_path.stat().st_size / (1024 * 1024)  # MB
+        # Handle S3 URLs
+        if image_path.startswith('http'):
+            import requests
+            response = requests.get(image_path)
+            img = Image.open(io.BytesIO(response.content))
+            original_size = len(response.content) / (1024 * 1024)
+        else:
+            # Local file
+            path = Path(image_path)
+            img = Image.open(path)
+            original_size = path.stat().st_size / (1024 * 1024)
         
         logger.debug(f"Original image: {img.size}, {original_size:.2f}MB")
         
@@ -114,7 +121,8 @@ class ImageGenerationService:
         add_watermark: bool = False
     ) -> Tuple[str, Optional[str]]:
         """
-        Generate image using Gemini API with robust error handling
+        Generate image using Gemini API with S3 support
+        Returns S3 URLs or local paths based on USE_S3 setting
         """
         try:
             logger.info(f"🚀 Starting image generation - Mode: {generation_mode}")
@@ -186,8 +194,15 @@ class ImageGenerationService:
                     else:
                         raise Exception(f"Gemini API error: {error_msg}")
             
-            # Save generated image
+            # Save generated image (locally first, then upload to S3 if enabled)
             generated_path = self._save_generated_image(response)
+            
+            # Upload to S3 if enabled
+            if settings.USE_S3:
+                generated_path = StorageService.save_generated_image(
+                    generated_path, 
+                    folder="generated"
+                )
             
             # Add watermark if requested
             watermarked_path = None
@@ -213,16 +228,16 @@ class ImageGenerationService:
         # Load and optimize user images (ALL converted to 9:16)
         user_pil_images = []
         for i, path in enumerate(user_images, 1):
-            img_path = self._validate_and_get_path(path, f"User {i}")
-            pil_img = self._optimize_image(img_path)
+            self._validate_file_exists(path, f"User {i}")
+            pil_img = self._optimize_image(path)
             user_pil_images.append(pil_img)
             logger.debug(f"✓ User image {i} optimized to 9:16: {pil_img.size}")
         
         # Load and optimize partner images (ALL converted to 9:16)
         partner_pil_images = []
         for i, path in enumerate(partner_images, 1):
-            img_path = self._validate_and_get_path(path, f"Partner {i}")
-            pil_img = self._optimize_image(img_path)
+            self._validate_file_exists(path, f"Partner {i}")
+            pil_img = self._optimize_image(path)
             partner_pil_images.append(pil_img)
             logger.debug(f"✓ Partner image {i} optimized to 9:16: {pil_img.size}")
         
@@ -246,8 +261,8 @@ class ImageGenerationService:
         """Prepare content for COUPLE mode with optimization"""
         logger.info("Preparing COUPLE mode generation")
         
-        couple_path = self._validate_and_get_path(couple_image_path, "Couple")
-        couple_image = self._optimize_image(couple_path)
+        self._validate_file_exists(couple_image_path, "Couple")
+        couple_image = self._optimize_image(couple_image_path)
         logger.debug(f"✓ Couple image optimized to 9:16: {couple_image.size}")
         
         full_prompt = self._create_couple_prompt(prompt)
@@ -255,15 +270,20 @@ class ImageGenerationService:
         
         return contents, full_prompt
     
-    def _validate_and_get_path(self, file_path: str, label: str) -> Path:
-        """Validate file exists and return Path object"""
+    def _validate_file_exists(self, file_path: str, label: str):
+        """Validate file exists (supports both local and S3)"""
+        if file_path.startswith('http'):
+            # S3 URL - we'll validate on download
+            logger.debug(f"{label} image is S3 URL: {file_path}")
+            return
+        
+        # Local path
         path = Path(file_path)
         if not path.exists():
             raise FileNotFoundError(f"{label} image not found at: {file_path}")
-        return path
     
-    def _save_generated_image(self, response) -> Path:
-        """Save generated image from API response"""
+    def _save_generated_image(self, response) -> str:
+        """Save generated image locally (will be uploaded to S3 later if enabled)"""
         if not response.candidates or not response.candidates[0].content.parts:
             raise Exception("No valid response from Gemini API")
         
@@ -271,7 +291,7 @@ class ImageGenerationService:
         if not hasattr(part, 'inline_data') or not part.inline_data:
             raise Exception("No inline image data found in response")
         
-        # Create output directory
+        # Create output directory (always save locally first)
         generated_dir = Path(settings.GENERATED_DIR)
         generated_dir.mkdir(parents=True, exist_ok=True)
         
@@ -283,38 +303,54 @@ class ImageGenerationService:
         generated_image.save(str(generated_path))
         
         # Log final dimensions
-        logger.info(f"💾 Image saved: {generated_path} ({generated_image.size})")
-        return generated_path
+        logger.info(f"💾 Image saved locally: {generated_path} ({generated_image.size})")
+        return str(generated_path)
         
-    def _add_watermark(self, image_path: Path) -> str:
+    def _add_watermark(self, image_path: str) -> str:
         """Add watermark to generated image"""
         try:
+            # Download from S3 if needed
+            if image_path.startswith('http'):
+                import requests
+                import tempfile
+                
+                response = requests.get(image_path)
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp:
+                    tmp.write(response.content)
+                    local_temp = tmp.name
+            else:
+                local_temp = image_path
+            
+            # Create watermarked version locally
             generated_dir = Path(settings.GENERATED_DIR)
+            generated_dir.mkdir(parents=True, exist_ok=True)
             watermarked_filename = f"{uuid.uuid4()}_watermarked.png"
-            watermarked_path = str(generated_dir / watermarked_filename)
+            watermarked_local_path = str(generated_dir / watermarked_filename)
             
             WatermarkService.add_watermark(
-                str(image_path),
-                watermarked_path,
+                local_temp,
+                watermarked_local_path,
                 settings.WATERMARK_TEXT
             )
+            
+            # Upload to S3 if enabled
+            if settings.USE_S3:
+                watermarked_path = StorageService.save_generated_image(
+                    watermarked_local_path,
+                    folder="generated"
+                )
+            else:
+                watermarked_path = watermarked_local_path
             
             logger.info(f"🖼️ Watermark added: {watermarked_path}")
             return watermarked_path
             
         except Exception as e:
             logger.error(f"❌ Watermark addition failed: {str(e)}")
-            return str(image_path)
+            return image_path
     
-    def _create_flexible_prompt(
-        self,
-        template_prompt: str,
-        user_count: int,
-        partner_count: int
-    ) -> str:
-        """
-        ULTRA-ENHANCED for pixel-perfect face matching
-        """
+    def _create_flexible_prompt(self, template_prompt: str, user_count: int, partner_count: int) -> str:
+        """ULTRA-ENHANCED for pixel-perfect face matching"""
         
         # Build reference description
         if user_count == 1 and partner_count == 1:
@@ -398,9 +434,7 @@ Before finalizing output, verify: "If shown the reference and output side-by-sid
 OUTPUT: A professional pre-wedding photograph in vertical phone format with EXACT FACE MATCHES from reference images naturally integrated into the described scene."""
             
     def _create_couple_prompt(self, template_prompt: str) -> str:
-        """
-        ULTRA-ENHANCED for pixel-perfect couple face matching
-        """
+        """ULTRA-ENHANCED for pixel-perfect couple face matching"""
         return f"""REFERENCE IMAGE: One image showing both people together.
 
 PRIMARY OBJECTIVE: Use this reference as an ABSOLUTE template. The faces and body proportions in the output MUST be indistinguishable from the reference. Imagine you are doing face transplants for both people - copy EVERY detail pixel by pixel.
